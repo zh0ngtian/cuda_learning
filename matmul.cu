@@ -612,7 +612,7 @@ void run(int nsize) {
 }
 
 int main() {
-  std::vector<int> nsizes = {128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+  std::vector<int> nsizes = {128, 256, 512, 1024, 2048};
   for (auto nsize : nsizes) {
     run(nsize);
   }
