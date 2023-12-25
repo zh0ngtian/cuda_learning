@@ -1,0 +1,14 @@
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 120
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+BinPackArguments: false
+BinPackParameters: false
+
+BraceWrapping:
+  AfterEnum: true
+
+SortIncludes: true
+IncludeBlocks: Preserve
