@@ -189,8 +189,7 @@ __global__ void matrixMultiplyKernel2(float *A, float *B, float *C, int m, int n
             for (int ty = 0; ty < THREAD_SIZE_Y; ++ty) {
                 #pragma unroll
                 for (int tx = 0; tx < THREAD_SIZE_X; ++tx) {
-                    r_c[ty][tx] +=
-                        s_a[THREAD_SIZE_Y * threadIdx.y + ty][kk] * s_b[kk][THREAD_SIZE_X * threadIdx.x + tx];
+                    r_c[ty][tx] += s_a[THREAD_SIZE_Y * threadIdx.y + ty][kk] * s_b[kk][THREAD_SIZE_X * threadIdx.x + tx];
                 }
             }
         }
@@ -400,15 +399,13 @@ __global__ void matrixMultiplyKernel4(float *A, float *B, float *C, int m, int n
             // preload A from shared memory to register
             #pragma unroll
             for (int ty = 0; ty < THREAD_SIZE_Y; ty += 4) {
-                FETCH_FLOAT4(frag_a[(kk + 1) % 2][ty]) =
-                    FETCH_FLOAT4(s_a[load_stage_idx][kk + 1][THREAD_SIZE_Y * threadIdx.y + ty]);
+                FETCH_FLOAT4(frag_a[(kk + 1) % 2][ty]) = FETCH_FLOAT4(s_a[load_stage_idx][kk + 1][THREAD_SIZE_Y * threadIdx.y + ty]);
             }
 
             // preload B from shared memory to register
             #pragma unroll
             for (int tx = 0; tx < THREAD_SIZE_X; tx += 4) {
-                FETCH_FLOAT4(frag_b[(kk + 1) % 2][tx]) =
-                    FETCH_FLOAT4(s_b[load_stage_idx][kk + 1][THREAD_SIZE_X * threadIdx.x + tx]);
+                FETCH_FLOAT4(frag_b[(kk + 1) % 2][tx]) = FETCH_FLOAT4(s_b[load_stage_idx][kk + 1][THREAD_SIZE_X * threadIdx.x + tx]);
             }
 
             // calculate C (this tile)
@@ -436,8 +433,7 @@ __global__ void matrixMultiplyKernel4(float *A, float *B, float *C, int m, int n
             #pragma unroll
             for (int i = 0; i < BLOCK_SIZE_K; i += B_TILE_ROW_STRIDE) {
                 int ldg_index = i / B_TILE_ROW_STRIDE * 4;
-                FETCH_FLOAT4(s_b[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) =
-                    FETCH_FLOAT4(ldg_b_reg[ldg_index]);
+                FETCH_FLOAT4(s_b[write_stage_idx][B_TILE_ROW_START + i][B_TILE_COL]) = FETCH_FLOAT4(ldg_b_reg[ldg_index]);
             }
 
             __syncthreads();
