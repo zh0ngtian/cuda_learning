@@ -1,3 +1,3 @@
 set -e
 
-./p-clang-format -i *.cu
+./p-clang-format -i kernels/*.cu
