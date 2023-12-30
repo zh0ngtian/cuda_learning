@@ -2,6 +2,6 @@ set -e
 
 export CUDA_VISIBLE_DEVICES="2"
 
-nvcc -o $1 -arch=compute_86 -code=sm_86 $1.cu -lcublas -lcudnn
+nvcc -o build/$1 -arch=compute_86 -code=sm_86 kernels/$1.cu -lcublas -lcudnn
 
-./$1
+./build/$1
