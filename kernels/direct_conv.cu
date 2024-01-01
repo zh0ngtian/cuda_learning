@@ -1,5 +1,6 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cudnn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -235,8 +236,8 @@ __global__ void gpu_direct_conv(float *in, float *out, float *kernel, int in_c, 
 
 int main() {
     const int in_c = 3;
-    const int in_h = 1024;
-    const int in_w = 1024;
+    const int in_h = 1000;
+    const int in_w = 1000;
     const int KERNEL_HEIGHT = 6;
     const int KERNEL_WIDTH = 6;
     const int BLOCK_HEIGHT = 8;
@@ -244,6 +245,7 @@ int main() {
     const int out_c = 3;
     const int out_h = in_h - KERNEL_HEIGHT + 1;
     const int out_w = in_w - KERNEL_WIDTH + 1;
+    const int OUTPUT_PER_THREAD = 1;
 
     float *cpu_input, *cpu_output, *cpu_kernel, *cuda_output;
     int input_size = in_c * in_h * in_w;
@@ -263,6 +265,12 @@ int main() {
         cpu_output[i] = 0;
         cuda_output[i] = 0;
     }
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    int iters = 100, warmup = 10;
+    float msec_total = 0;
 
     /* ---- CPU BEGIN ---- */
     cpu_conv(cpu_input, cpu_output, cpu_kernel, in_c, in_h, in_w, out_c, out_h, out_w, KERNEL_HEIGHT, KERNEL_WIDTH);
@@ -289,21 +297,29 @@ int main() {
 
     const int MALLOC_BLOCK_HEIGHT = (BLOCK_HEIGHT + KERNEL_HEIGHT) * 2;  // 乘以 2 为了应对边缘 block 的情况
     const int MALLOC_BLOCK_WIDTH = (BLOCK_WIDTH + KERNEL_WIDTH) * 2;     // 乘以 2 为了应对边缘 block 的情况
-    const int OUTPUT_PER_THREAD = 2;
-    const int MALLOC_TEMP_SIZE = out_c * 8;  // temp out channel data
+    const int MALLOC_TEMP_SIZE = out_c * 8;
 
-    printf("KERNEL_HEIGHT: %d, KERNEL_WIDTH: %d, MALLOC_BLOCK_HEIGHT: %d, MALLOC_BLOCK_WIDTH: %d, MALLOC_TEMP_SIZE: %d\n",
-           KERNEL_HEIGHT,
-           KERNEL_WIDTH,
-           MALLOC_BLOCK_HEIGHT,
-           MALLOC_BLOCK_WIDTH,
-           MALLOC_TEMP_SIZE);
+    // printf("KERNEL_HEIGHT: %d, KERNEL_WIDTH: %d, MALLOC_BLOCK_HEIGHT: %d, MALLOC_BLOCK_WIDTH: %d, MALLOC_TEMP_SIZE: %d\n",
+    //        KERNEL_HEIGHT,
+    //        KERNEL_WIDTH,
+    //        MALLOC_BLOCK_HEIGHT,
+    //        MALLOC_BLOCK_WIDTH,
+    //        MALLOC_TEMP_SIZE);
 
     dim3 dim_grid(out_w / BLOCK_WIDTH, out_h / BLOCK_HEIGHT);
     dim3 dim_block(BLOCK_WIDTH, BLOCK_HEIGHT);
 
-    gpu_direct_conv<BLOCK_HEIGHT, BLOCK_WIDTH, KERNEL_HEIGHT, KERNEL_WIDTH, MALLOC_TEMP_SIZE, MALLOC_BLOCK_HEIGHT, MALLOC_BLOCK_WIDTH, OUTPUT_PER_THREAD>
-        <<<dim_grid, dim_block>>>(gpu_input, gpu_output, gpu_kernel, in_c, in_h, in_w, out_c, out_h, out_w);
+    for (int run = 0; run < iters + warmup; run++) {
+        if (run == warmup) cudaEventRecord(start);
+        gpu_direct_conv<BLOCK_HEIGHT, BLOCK_WIDTH, KERNEL_HEIGHT, KERNEL_WIDTH, MALLOC_TEMP_SIZE, MALLOC_BLOCK_HEIGHT, MALLOC_BLOCK_WIDTH, OUTPUT_PER_THREAD>
+            <<<dim_grid, dim_block>>>(gpu_input, gpu_output, gpu_kernel, in_c, in_h, in_w, out_c, out_h, out_w);
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&msec_total, start, stop);
+    printf("direct_conv cost time: %f\n", msec_total / (iters));
+
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("execute kernel function: %s\n", cudaGetErrorString(err));
@@ -322,4 +338,57 @@ int main() {
         }
     }
     /* ---- GPU END ---- */
+
+    /* ---- CUDNN CONV BEGIN ----*/
+    cudnnHandle_t handle;
+    cudnnCreate(&handle);
+    cudnnTensorDescriptor_t input_desc;
+    cudnnCreateTensorDescriptor(&input_desc);
+    cudnnSetTensor4dDescriptor(input_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, in_c, in_h, in_w);
+
+    cudnnTensorDescriptor_t output_desc;
+    cudnnCreateTensorDescriptor(&output_desc);
+    cudnnSetTensor4dDescriptor(output_desc, CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1, out_c, out_h, out_w);
+
+    cudnnFilterDescriptor_t kernel_desc;
+    cudnnCreateFilterDescriptor(&kernel_desc);
+    cudnnSetFilter4dDescriptor(kernel_desc, CUDNN_DATA_FLOAT, CUDNN_TENSOR_NCHW, out_c, in_c, KERNEL_HEIGHT, KERNEL_WIDTH);
+
+    cudnnConvolutionDescriptor_t conv_desc;
+    cudnnCreateConvolutionDescriptor(&conv_desc);
+    cudnnSetConvolution2dDescriptor(conv_desc, 0, 0, 1, 1, 1, 1, CUDNN_CONVOLUTION, CUDNN_DATA_FLOAT);
+
+    size_t space_size = 0;
+    cudnnConvolutionFwdAlgo_t alg_kind = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+    cudnnStatus_t error = cudnnGetConvolutionForwardWorkspaceSize(handle, input_desc, kernel_desc, conv_desc, output_desc, alg_kind, &space_size);
+    if (error != CUDNN_STATUS_SUCCESS) {
+        printf("calc spacesize failed: %s\n", cudnnGetErrorString(error));
+    }
+
+    void *workspace = nullptr;
+    cudaMalloc(&workspace, space_size);
+
+    auto alpha = 1.0f;
+    auto beta = 0.0f;
+    for (int run = 0; run < iters + warmup; run++) {
+        if (run == warmup) cudaEventRecord(start);
+        error = cudnnConvolutionForward(handle, &alpha, input_desc, gpu_input, kernel_desc, gpu_kernel, conv_desc, alg_kind, workspace, space_size, &beta, output_desc, gpu_output);
+    }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&msec_total, start, stop);
+    printf("cudnn cost time: %f\n", msec_total / (iters));
+
+    if (error != CUDNN_STATUS_SUCCESS) {
+        printf("cudnn forward failed: %s\n", cudnnGetErrorString(error));
+    }
+
+    cudaFree(workspace);
+    cudnnDestroyTensorDescriptor(input_desc);
+    cudnnDestroyTensorDescriptor(output_desc);
+    cudnnDestroyFilterDescriptor(kernel_desc);
+    cudnnDestroyConvolutionDescriptor(conv_desc);
+    cudnnDestroy(handle);
+    /* ---- CUDNN CONV END ---- */
 }
