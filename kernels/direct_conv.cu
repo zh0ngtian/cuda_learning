@@ -1,9 +1,7 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cudnn.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
@@ -18,8 +16,9 @@ void cpu_conv(float *in, float *out, float *cpu_kernel, int in_c, int in_h, int 
                 for (int ic = 0; ic < in_c; ++ic) {
                     for (int ii = 0; ii < kernel_h; ++ii) {
                         for (int jj = 0; jj < kernel_w; ++jj) {
+                            if (i + ii >= in_h || j + jj >= in_w) continue;
                             in_pos = ic * in_h * in_w + OFFSET(i + ii, j + jj, in_w);
-                            kernel_pos = oc * kernel_h * kernel_w + OFFSET(ii, jj, kernel_w);
+                            kernel_pos = oc * in_c * kernel_h * kernel_w + ic * kernel_h * kernel_w + OFFSET(ii, jj, kernel_w);
                             val += in[in_pos] * cpu_kernel[kernel_pos];
                         }
                     }
@@ -38,7 +37,7 @@ template <const int BLOCK_HEIGHT,
           const int MALLOC_BLOCK_HEIGHT,
           const int MALLOC_BLOCL_WIDTH,
           const int OUTPUT_PER_THREAD>
-__global__ void gpu_direct_conv(float *in, float *out, float *kernel, int in_c, int in_h, int in_w, int out_c, int out_h, int out_w) {
+__global__ void direct_conv(float *in, float *out, float *kernel, int in_c, int in_h, int in_w, int out_c, int out_h, int out_w) {
     int block_y = blockIdx.y;
     int block_x = blockIdx.x;
     int thread_y = threadIdx.y;
@@ -299,19 +298,12 @@ int main() {
     const int MALLOC_BLOCK_WIDTH = (BLOCK_WIDTH + KERNEL_WIDTH) * 2;     // 乘以 2 为了应对边缘 block 的情况
     const int MALLOC_TEMP_SIZE = out_c * 8;
 
-    // printf("KERNEL_HEIGHT: %d, KERNEL_WIDTH: %d, MALLOC_BLOCK_HEIGHT: %d, MALLOC_BLOCK_WIDTH: %d, MALLOC_TEMP_SIZE: %d\n",
-    //        KERNEL_HEIGHT,
-    //        KERNEL_WIDTH,
-    //        MALLOC_BLOCK_HEIGHT,
-    //        MALLOC_BLOCK_WIDTH,
-    //        MALLOC_TEMP_SIZE);
-
     dim3 dim_grid(out_w / BLOCK_WIDTH, out_h / BLOCK_HEIGHT);
     dim3 dim_block(BLOCK_WIDTH, BLOCK_HEIGHT);
 
     for (int run = 0; run < iters + warmup; run++) {
         if (run == warmup) cudaEventRecord(start);
-        gpu_direct_conv<BLOCK_HEIGHT, BLOCK_WIDTH, KERNEL_HEIGHT, KERNEL_WIDTH, MALLOC_TEMP_SIZE, MALLOC_BLOCK_HEIGHT, MALLOC_BLOCK_WIDTH, OUTPUT_PER_THREAD>
+        direct_conv<BLOCK_HEIGHT, BLOCK_WIDTH, KERNEL_HEIGHT, KERNEL_WIDTH, MALLOC_TEMP_SIZE, MALLOC_BLOCK_HEIGHT, MALLOC_BLOCK_WIDTH, OUTPUT_PER_THREAD>
             <<<dim_grid, dim_block>>>(gpu_input, gpu_output, gpu_kernel, in_c, in_h, in_w, out_c, out_h, out_w);
     }
 
