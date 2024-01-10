@@ -20,19 +20,19 @@ const int WMMA_K = 16;
 
 bool is_close(float input, float other, float rtol, float atol) { return ABS(input - other) <= atol + rtol * ABS(other); }
 
-void cpu_conv(float *in, float *out, float *cpu_kernel, int in_c, int in_h, int in_w, int out_c, int out_h, int out_w, int kernel_h, int kernel_w) {
+void cpu_conv(float *in, float *out, float *cpu_kernel, int IC, int IH, int IW, int OC, int OH, int OW, int KH, int KW) {
     int out_pos, in_pos, kernel_pos;
-    for (int oc = 0; oc < out_c; ++oc) {
-        for (int i = 0; i < out_h; ++i) {
-            for (int j = 0; j < out_w; ++j) {
+    for (int oc = 0; oc < OC; ++oc) {
+        for (int i = 0; i < OH; ++i) {
+            for (int j = 0; j < OW; ++j) {
                 float val = 0;
-                out_pos = oc * out_h * out_w + OFFSET(i, j, out_w);
-                for (int ic = 0; ic < in_c; ++ic) {
-                    for (int ii = 0; ii < kernel_h; ++ii) {
-                        for (int jj = 0; jj < kernel_w; ++jj) {
-                            if (i + ii >= in_h || j + jj >= in_w) continue;
-                            in_pos = ic * in_h * in_w + OFFSET(i + ii, j + jj, in_w);
-                            kernel_pos = oc * in_c * kernel_h * kernel_w + ic * kernel_h * kernel_w + OFFSET(ii, jj, kernel_w);
+                out_pos = oc * OH * OW + OFFSET(i, j, OW);
+                for (int ic = 0; ic < IC; ++ic) {
+                    for (int ii = 0; ii < KH; ++ii) {
+                        for (int jj = 0; jj < KW; ++jj) {
+                            if (i + ii >= IH || j + jj >= IW) continue;
+                            in_pos = ic * IH * IW + OFFSET(i + ii, j + jj, IW);
+                            kernel_pos = oc * IC * KH * KW + ic * KH * KW + OFFSET(ii, jj, KW);
                             val += in[in_pos] * cpu_kernel[kernel_pos];
                         }
                     }
@@ -43,30 +43,30 @@ void cpu_conv(float *in, float *out, float *cpu_kernel, int in_c, int in_h, int 
     }
 }
 
-template <const int KERNEL_SIZE, const int STRIDE, const int WARPS_PER_BLOCK>
-__global__ void implicit_gemm_conv(__half *input, __half *output, __half *kernel, const int n, const int in_c, const int in_h, const int in_w, const int out_c, const int out_h, const int out_w) {
-    const int UNROLLED_KERNEL_SIZE = KERNEL_SIZE * KERNEL_SIZE;  // 每个卷积核单通道展开后的大小
-    const int SLICE_SIZE = in_c * UNROLLED_KERNEL_SIZE;          // 每个卷积核展开后的大小
+template <const int KH, const int KW, const int WARPS_PER_BLOCK>
+__global__ void implicit_gemm_conv(__half *input, __half *output, __half *kernel, const int N, const int IC, const int IH, const int IW, const int OC, const int OH, const int OW) {
+    const int UNROLLED_KERNEL_SIZE = KH * KW;          // 每个卷积核单通道展开后的大小
+    const int SLICE_SIZE = IC * UNROLLED_KERNEL_SIZE;  // 每个卷积核展开后的大小
 
     const int WMMA_INPUT_TILE_SIZE = WMMA_M * WMMA_K;
     const int WMMA_FILTER_TILE_SIZE = WMMA_K * WMMA_N;
 
-    int GEMM_M = n * out_h * out_w;
-    int GEMM_N = out_c;
+    int GEMM_M = N * OH * OW;
+    int GEMM_N = OC;
     int GEMM_K = SLICE_SIZE;
 
-    const int out_n_stride = out_h * out_w;
-    const int out_h_stride = out_w;
+    const int out_n_stride = OH * OW;
+    const int out_h_stride = OW;
     const int out_w_stride = 1;
 
-    const int in_n_stride = in_c * in_h * in_w;
-    const int in_c_stride = in_h * in_w;
-    const int in_h_stride = in_w;
+    const int in_n_stride = IC * IH * IW;
+    const int in_c_stride = IH * IW;
+    const int in_h_stride = IW;
     const int in_w_stride = 1;
 
-    const int kernel_n_stride = in_c * KERNEL_SIZE * KERNEL_SIZE;
-    const int kernel_c_stride = KERNEL_SIZE * KERNEL_SIZE;
-    const int kernel_h_stride = KERNEL_SIZE;
+    const int kernel_n_stride = IC * KH * KW;
+    const int kernel_c_stride = KH * KW;
+    const int kernel_h_stride = KW;
     const int kernel_w_stride = 1;
 
     // 一个 block 中有 256 个线程，分成 256/32=8 个 warp
@@ -112,11 +112,11 @@ __global__ void implicit_gemm_conv(__half *input, __half *output, __half *kernel
 
             int offsets[3] = {0, 1, 2};
 
-            int y = p + offsets[(abs_slice_col % UNROLLED_KERNEL_SIZE) / KERNEL_SIZE];  // 每个线程此时需要搬运的数据在输入 feature map 中的列索引
-            int x = q + offsets[(abs_slice_col % UNROLLED_KERNEL_SIZE) % KERNEL_SIZE];  // 每个线程此时需要搬运的数据在输入 feature map 中的行索引
-            int c = abs_slice_col / UNROLLED_KERNEL_SIZE;                               // 每个线程此时需要搬运的数据在输入 feature map 中的通道索引
+            int y = p + offsets[(abs_slice_col % UNROLLED_KERNEL_SIZE) / KW];  // 每个线程此时需要搬运的数据在输入 feature map 中的列索引
+            int x = q + offsets[(abs_slice_col % UNROLLED_KERNEL_SIZE) % KW];  // 每个线程此时需要搬运的数据在输入 feature map 中的行索引
+            int c = abs_slice_col / UNROLLED_KERNEL_SIZE;                      // 每个线程此时需要搬运的数据在输入 feature map 中的通道索引
 
-            if (x >= 0 && x < in_w && y >= 0 && y < in_h) {  // 防止边缘处越界
+            if (x >= 0 && x < IW && y >= 0 && y < IH) {  // 防止边缘处越界
                 int idx = n * in_n_stride + c * in_c_stride + y * in_h_stride + x * in_w_stride;
                 input_tile_start[j] = input[idx];
             } else {
@@ -131,16 +131,14 @@ __global__ void implicit_gemm_conv(__half *input, __half *output, __half *kernel
             int abs_slice_row = b_row + rel_slice_row;                                   // 每个线程此时需要搬运的数据在权重矩阵中的全局行索引
             int abs_slice_col = b_col + (j % WMMA_K);                                    // 每个线程此时需要搬运的数据在权重矩阵中的全局列索引
 
-            int k = abs_slice_col;                                         // 每个线程此时需要搬运的数据在卷积核中的卷积核索引
-            int c = abs_slice_row / UNROLLED_KERNEL_SIZE;                  // 每个线程此时需要搬运的数据在卷积核中的通道索引
-            int r = (abs_slice_row % UNROLLED_KERNEL_SIZE) / KERNEL_SIZE;  // 每个线程此时需要搬运的数据在卷积核中的列索引
-            int s = (abs_slice_row % UNROLLED_KERNEL_SIZE) % KERNEL_SIZE;  // 每个线程此时需要搬运的数据在卷积核中的行索引
+            int k = abs_slice_col;                                // 每个线程此时需要搬运的数据在卷积核中的卷积核索引
+            int c = abs_slice_row / UNROLLED_KERNEL_SIZE;         // 每个线程此时需要搬运的数据在卷积核中的通道索引
+            int r = (abs_slice_row % UNROLLED_KERNEL_SIZE) / KW;  // 每个线程此时需要搬运的数据在卷积核中的列索引
+            int s = (abs_slice_row % UNROLLED_KERNEL_SIZE) % KW;  // 每个线程此时需要搬运的数据在卷积核中的行索引
 
             int idx = k * kernel_n_stride + c * kernel_c_stride + r * kernel_h_stride + s * kernel_w_stride;
             weight_tile_start[j] = kernel[idx];
         }
-
-        __syncthreads();
 
         // 使用 tensor core 完成矩阵乘法
         if (a_row < GEMM_M && a_col < GEMM_K && b_row < GEMM_K && b_col < GEMM_N) {
@@ -160,28 +158,31 @@ __global__ void implicit_gemm_conv(__half *input, __half *output, __half *kernel
 }
 
 int main() {
-    const int PADDING_SIZE = 1;
-    const int KERNEL_SIZE = 3;
-    const int STRIDE = 1;
+    const int PADDING_H = 1;
+    const int PADDING_W = 1;
+    const int STRIDE_H = 1;
+    const int STRIDE_W = 1;
+    const int KH = 3;
+    const int KW = 3;
     const int WARPS_PER_BLOCK = 8;
 
-    const int n = 1;
-    const int in_c = 8;
-    const int in_h = 64;
-    const int in_w = 64;
-    const int out_c = 16;
-    const int out_h = (in_h - KERNEL_SIZE + 2 * PADDING_SIZE) / STRIDE + 1;
-    const int out_w = (in_w - KERNEL_SIZE + 2 * PADDING_SIZE) / STRIDE + 1;
+    const int N = 1;
+    const int IC = 8;
+    const int IH = 64;
+    const int IW = 64;
+    const int OC = 16;
+    const int OH = (IH - KH + 2 * PADDING_H) / STRIDE_H + 1;
+    const int OW = (IW - KW + 2 * PADDING_W) / STRIDE_W + 1;
 
-    int GEMM_M = n * out_h * out_w;
-    int GEMM_N = out_c;
+    int GEMM_M = N * OH * OW;
+    int GEMM_N = OC;
     assert(GEMM_M % WMMA_M == 0);
     assert(GEMM_N % WMMA_N == 0);
-    assert(n == 1);
+    assert(N == 1);
 
-    int input_size = n * in_c * in_h * in_w;
-    int output_size = out_c * out_h * out_w;
-    int kernel_size = out_c * in_c * KERNEL_SIZE * KERNEL_SIZE;
+    int input_size = N * IC * IH * IW;
+    int output_size = OC * OH * OW;
+    int kernel_size = OC * IC * KH * KW;
     float *cpu_input, *cpu_output, *cpu_kernel, *cuda_output;
     cpu_input = (float *)malloc(input_size * sizeof(float));
     cpu_output = (float *)malloc(output_size * sizeof(float));
@@ -200,7 +201,7 @@ int main() {
     }
 
     /* ---- CPU BEGIN ---- */
-    cpu_conv(cpu_input, cpu_output, cpu_kernel, in_c, in_h, in_w, out_c, out_h, out_w, KERNEL_SIZE, KERNEL_SIZE);
+    cpu_conv(cpu_input, cpu_output, cpu_kernel, IC, IH, IW, OC, OH, OW, KH, KW);
     /* ---- CPU END ---- */
 
     /* ---- GPU BEGIN ---- */
@@ -242,7 +243,7 @@ int main() {
     dim3 dim_grid((GEMM_M + (WMMA_M * dim_block.x / 32 - 1)) / (WMMA_M * dim_block.x / 32), (GEMM_N + WMMA_N * dim_block.y - 1) / (WMMA_N * dim_block.y));
     assert(dim_block.y * dim_block.x / WARP_SIZE == WARPS_PER_BLOCK);
 
-    implicit_gemm_conv<KERNEL_SIZE, STRIDE, WARPS_PER_BLOCK><<<dim_grid, dim_block>>>(gpu_input_fp16, gpu_output_fp16, gpu_kernel_fp16, n, in_c, in_h, in_w, out_c, out_h, out_w);
+    implicit_gemm_conv<KH, KW, WARPS_PER_BLOCK><<<dim_grid, dim_block>>>(gpu_input_fp16, gpu_output_fp16, gpu_kernel_fp16, N, IC, IH, IW, OC, OH, OW);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("execute kernel function: %s\n", cudaGetErrorString(err));
