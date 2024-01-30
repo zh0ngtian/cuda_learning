@@ -6,19 +6,19 @@
 
 void img2col(float* data_img, int channels, int height, int width, int ksize, int stride, int pad, float* data_col) {
     int c, h, w;
-    int height_col = (height + 2 * pad - ksize) / stride + 1;
-    int width_col = (width + 2 * pad - ksize) / stride + 1;
+    int num_tile_y = (height + 2 * pad - ksize) / stride + 1;
+    int num_tile_x = (width + 2 * pad - ksize) / stride + 1;
 
     int channels_col = channels * ksize * ksize;
     for (c = 0; c < channels_col; ++c) {
         int w_offset = c % ksize;
         int h_offset = (c / ksize) % ksize;
         int c_img = c / ksize / ksize;
-        for (h = 0; h < height_col; ++h) {
-            for (w = 0; w < width_col; ++w) {
+        for (h = 0; h < num_tile_y; ++h) {
+            for (w = 0; w < num_tile_x; ++w) {
                 int row_img = h_offset + h * stride;
                 int col_img = w_offset + w * stride;
-                int col_index = (c * height_col + h) * width_col + w;
+                int col_index = (c * num_tile_y + h) * num_tile_x + w;
                 row_img -= pad;
                 col_img -= pad;
                 if (row_img >= 0 && col_img >= 0 && row_img < height && col_img < width) {
@@ -48,26 +48,26 @@ void transform_g(float* g, float* transformed_g, int in_channels, int out_channe
     for (int oc = 0; oc < out_channels; ++oc) {
         for (int ic = 0; ic < in_channels; ++ic) {
             memset(Gg, 0, in_tile_size * r * sizeof(float));
-            matmul(in_tile_size, r, r, G, oc * in_channels * 9 + ic * 9 + g, Gg);
+            matmul(in_tile_size, r, r, G, oc * in_channels * r * r + ic * r * r + g, Gg);
             matmul(in_tile_size, in_tile_size, r, Gg, GT, oc * in_channels * in_tile_size * in_tile_size + ic * in_tile_size * in_tile_size + transformed_g);
         }
     }
 }
 
-__global__ void transform_d(float* in, int channels, int height, int width, int stride, int m, int r, float* d, int height_col, int width_col, const int in_tile_size) {
+__global__ void transform_d(float* in, int channels, int height, int width, int stride, int m, int r, float* d, int num_tile_y, int num_tile_x, const int in_tile_size) {
     int w = blockIdx.x * blockDim.x + threadIdx.x;
     int h = blockIdx.y * blockDim.y + threadIdx.y;
 
     int tile_stride = in_tile_size - (r - stride);  // 相邻 tile 之间首元素的距离
 
     int tile_size = in_tile_size * in_tile_size;
-    int d_height_stride = width_col * tile_size;          // 输入 d 每行的元素数
-    int d_channel_stride = height_col * d_height_stride;  // 输入 d 每个通道的元素数
+    int d_height_stride = num_tile_x * tile_size;         // 输入 d 每行的元素数
+    int d_channel_stride = num_tile_y * d_height_stride;  // 输入 d 每个通道的元素数
     int in_height_stride = width * tile_stride;
     int in_channel_stride = height * width;
 
     for (int c = 0; c < channels; ++c) {
-        if (w < width_col && h < height_col) {
+        if (w < num_tile_x && h < num_tile_y) {
             for (int i = 0; i < in_tile_size; ++i) {
                 for (int j = 0; j < in_tile_size; ++j) {
                     int d_idx = c * d_channel_stride + h * d_height_stride + w * tile_size + i * in_tile_size + j;  // 块内连续
@@ -127,19 +127,19 @@ __device__ void winograd_2d(float* U, float* d, float* result) {
     result[3] += (ATUV[5] - ATUV[6] - ATUV[7]);
 }
 
-__global__ void conv_winograd(float* g, float* d, float* o, int height_col, int width_col, int in_channels, int out_channels, const int in_tile_size, const int out_tile_size) {
+__global__ void conv_winograd(float* g, float* d, float* o, int num_tile_y, int num_tile_x, int in_channels, int out_channels, const int in_tile_size, const int out_tile_size) {
     int w = blockIdx.x * blockDim.x + threadIdx.x;
     int h = blockIdx.y * blockDim.y + threadIdx.y;
 
     int g_channel_stride = in_channels * in_tile_size * in_tile_size;  // 卷积核 g 每个通道的元素数
-    int d_height_stride = width_col * in_tile_size * in_tile_size;     // 输入 d 每行的元素数
-    int d_channel_stride = height_col * d_height_stride;               // 输入 d 每个通道的元素数
-    int o_height_stride = width_col * out_tile_size * out_tile_size;   // 输出 o 每行的元素数
-    int o_channel_stride = height_col * o_height_stride;               // 输出 o 每个通道的元素数
+    int d_height_stride = num_tile_x * in_tile_size * in_tile_size;    // 输入 d 每行的元素数
+    int d_channel_stride = num_tile_y * d_height_stride;               // 输入 d 每个通道的元素数
+    int o_height_stride = num_tile_x * out_tile_size * out_tile_size;  // 输出 o 每行的元素数
+    int o_channel_stride = num_tile_y * o_height_stride;               // 输出 o 每个通道的元素数
 
     for (int oc = 0; oc < out_channels; ++oc) {
         for (int ic = 0; ic < in_channels; ++ic) {
-            if (w < width_col && h < height_col) {
+            if (w < num_tile_x && h < num_tile_y) {
                 winograd_2d(g + oc * g_channel_stride + ic * in_tile_size * in_tile_size,
                             d + ic * d_channel_stride + h * d_height_stride + w * in_tile_size * in_tile_size,
                             o + oc * o_channel_stride + h * o_height_stride + w * out_tile_size * out_tile_size);
@@ -149,9 +149,9 @@ __global__ void conv_winograd(float* g, float* d, float* o, int height_col, int 
 }
 
 __global__ void transform_o(
-    float* o, int channels, int height, int width, int ksize, int stride, int pad, int m, float* out, int height_col, int width_col, int height_out, int width_out, const int out_tile_size) {
-    // o:   height_col x width_col
-    // out: (height_col * out_tile_size) x (width_col / out_tile_size)
+    float* o, int channels, int height, int width, int ksize, int stride, int pad, int m, float* out, int num_tile_y, int num_tile_x, int height_out, int width_out, const int out_tile_size) {
+    // o:   num_tile_y x num_tile_x
+    // out: (num_tile_y * out_tile_size) x (num_tile_x / out_tile_size)
 
     int l = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -160,10 +160,10 @@ __global__ void transform_o(
     int out_height_stride = width_out * out_tile_size;  // 每次迭代跳过 out_tile_size 行
 
     int tile_size = out_tile_size * out_tile_size;
-    int o_height_stride = width_col * tile_size;
+    int o_height_stride = num_tile_x * tile_size;
 
     for (int c = 0; c < channels; ++c) {
-        if (k < width_col && l < height_col) {
+        if (k < num_tile_x && l < num_tile_y) {
             for (int i = 0; i < out_tile_size; ++i) {                                                                      // h 方向
                 for (int j = 0; j < out_tile_size; ++j) {                                                                  // w 方向
                     int out_idx = c * channel_stride + (l * out_height_stride + i * width_out) + (k * out_tile_size + j);  // 块内不连续
@@ -192,8 +192,8 @@ int main() {
     int w = 514, h = 514, c = 8, n = 8;
     int height_out = (h + 2 * pad - ksize) / stride + 1;
     int width_out = (w + 2 * pad - ksize) / stride + 1;
-    int height_col = height_out / m;  // 竖直方向上的 tile 数
-    int width_col = width_out / m;    // 水平方向上的 tile 数
+    int num_tile_y = height_out / m;  // 竖直方向上的 tile 数
+    int num_tile_x = width_out / m;   // 水平方向上的 tile 数
 
     float* d = (float*)malloc(w * h * c * sizeof(float));
     float* g = (float*)malloc(ksize * ksize * c * n * sizeof(float));
@@ -247,24 +247,24 @@ int main() {
 
     const int block_size = 16;  // 每个线程负责一个输入 tile，一个 block 负责 16 * 16 个 tile
     dim3 dim_block(block_size, block_size);
-    dim3 dim_grid(width_col / block_size, height_col / block_size);
+    dim3 dim_grid(num_tile_x / block_size, num_tile_y / block_size);
 
     // transform input
-    transform_d<<<dim_grid, dim_block>>>(d_cuda, c, h, w, stride, m, r, transformed_d_cuda, height_col, width_col, in_tile_size);
+    transform_d<<<dim_grid, dim_block>>>(d_cuda, c, h, w, stride, m, r, transformed_d_cuda, num_tile_y, num_tile_x, in_tile_size);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("execute kernel transform_d: %s\n", cudaGetErrorString(err));
     }
 
     // conv
-    conv_winograd<<<dim_grid, dim_block>>>(transformed_g_cuda, transformed_d_cuda, transformed_o_cuda, height_col, width_col, c, n, in_tile_size, out_tile_size);
+    conv_winograd<<<dim_grid, dim_block>>>(transformed_g_cuda, transformed_d_cuda, transformed_o_cuda, num_tile_y, num_tile_x, c, n, in_tile_size, out_tile_size);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("execute kernel conv_winograd: %s\n", cudaGetErrorString(err));
     }
 
     // transform back output
-    transform_o<<<dim_grid, dim_block>>>(transformed_o_cuda, n, h, w, ksize, stride, pad, m, output_cuda, height_col, width_col, height_out, width_out, out_tile_size);
+    transform_o<<<dim_grid, dim_block>>>(transformed_o_cuda, n, h, w, ksize, stride, pad, m, output_cuda, num_tile_y, num_tile_x, height_out, width_out, out_tile_size);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         printf("execute kernel conv_winograd: %s\n", cudaGetErrorString(err));
